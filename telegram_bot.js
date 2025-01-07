@@ -24,6 +24,7 @@ const bs58 = require('bs58');
 const express = require('express');
 const app = express();
 const port = process.env.PORT || 10000;
+const { createClient } = require('@supabase/supabase-js');
 
 // Env variables we need:
 // - TG_BOT_TOKEN (your Telegram Bot token from BotFather)
@@ -119,26 +120,36 @@ bot.onText(/\/begin/, async (msg) => {
   const chatId = msg.chat.id;
   const session = getSession(chatId);
 
-  // Count existing wallets
+  // Count existing wallets from Supabase
   let existingWalletCount = 0;
   try {
-    if (fs.existsSync(DB_DIR)) {
-      const files = fs.readdirSync(DB_DIR);
-      existingWalletCount = files.filter((f) => f.startsWith('trader_')).length;
+    // Query Supabase for trader wallets
+    const { data: wallets, error } = await supabase
+      .from('wallets')
+      .select('*')
+      .like('name', 'trader_%');
+
+    if (error) {
+      throw error;
     }
+
+    existingWalletCount = wallets.length;
+    
+    // Store the wallets data for later use
+    session.existingWallets = wallets;
+    
   } catch (error) {
-    logger.warn('Error checking existing wallets:', error);
+    logger.warn('Error checking existing wallets in Supabase:', error);
   }
 
   // Store the count in the session
   session.existingWalletCount = existingWalletCount;
-
-  session.step = 1; // Next step is to record whether user wants existing or new
+  session.step = 1;
 
   await bot.sendMessage(
     chatId,
     `Found ${existingWalletCount} existing trader wallet(s).\n` +
-      `Would you like to use them?`,
+    `Would you like to use them?`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -585,6 +596,14 @@ app.get('/health', (req, res) => {
     botRunning: bot !== null
   });
 });
+
+// Add after other environment checks
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+  throw new Error('SUPABASE_URL and SUPABASE_KEY must be defined in your .env');
+}
+
+// Initialize Supabase client
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // Start Express server
 app.listen(port, '0.0.0.0', () => {
