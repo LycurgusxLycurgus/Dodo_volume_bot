@@ -21,6 +21,7 @@ const SimpleVolumeBot = require('./simple_volume_bot');
 const logger = require('./logger');
 const { Keypair } = require('@solana/web3.js');
 const bs58 = require('bs58');
+const supabase = require('./supabase_client');
 
 // Env variables we need:
 // - TG_BOT_TOKEN (your Telegram Bot token from BotFather)
@@ -116,37 +117,52 @@ bot.onText(/\/begin/, async (msg) => {
   const chatId = msg.chat.id;
   const session = getSession(chatId);
 
-  // Count existing wallets
-  let existingWalletCount = 0;
   try {
-    if (fs.existsSync(DB_DIR)) {
-      const files = fs.readdirSync(DB_DIR);
-      existingWalletCount = files.filter((f) => f.startsWith('trader_')).length;
+    // Initialize main wallet first
+    const mainWallet = Keypair.fromSecretKey(
+      bs58.decode(process.env.PRIVATE_KEY)
+    );
+    const mainWalletPubkey = mainWallet.publicKey.toString();
+
+    // Query Supabase for existing wallets
+    const { data: existingWallets, error } = await supabase
+      .from('trader_wallets')
+      .select('*')
+      .eq('main_wallet_pubkey', mainWalletPubkey);
+
+    if (error) {
+      throw new Error(`Failed to query wallets: ${error.message}`);
     }
-  } catch (error) {
-    logger.warn('Error checking existing wallets:', error);
-  }
 
-  // Store the count in the session
-  session.existingWalletCount = existingWalletCount;
+    // Store the count in the session
+    const existingWalletCount = existingWallets?.length || 0;
+    session.existingWalletCount = existingWalletCount;
+    session.mainWallet = mainWallet; // Store for later use
 
-  session.step = 1; // Next step is to record whether user wants existing or new
+    session.step = 1;
 
-  await bot.sendMessage(
-    chatId,
-    `Found ${existingWalletCount} existing trader wallet(s).\n` +
-      `Would you like to use them?`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: 'Yes, use existing', callback_data: 'useExisting_yes' },
-            { text: 'No, create new', callback_data: 'useExisting_no' },
+    await bot.sendMessage(
+      chatId,
+      `Found ${existingWalletCount} existing trader wallet(s).\n` +
+        `Would you like to use them?`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'Yes, use existing', callback_data: 'useExisting_yes' },
+              { text: 'No, create new', callback_data: 'useExisting_no' },
+            ],
           ],
-        ],
-      },
-    }
-  );
+        },
+      }
+    );
+  } catch (error) {
+    logger.error('Error in /begin command:', error);
+    await bot.sendMessage(
+      chatId,
+      `Error checking existing wallets: ${error.message}`
+    );
+  }
 });
 
 // === Callback for step 1: use existing wallets or not ===
@@ -173,6 +189,16 @@ bot.on('callback_query', async (query) => {
       session.useExisting = true;
       // Set numWallets to the actual count of existing wallets
       session.numWallets = session.existingWalletCount;
+      
+      // Initialize SimpleVolumeBot with main wallet
+      const volumeBot = new SimpleVolumeBot({
+        privateKey: process.env.PRIVATE_KEY,
+        rpcEndpoint: process.env.SOLANA_RPC_URL
+      });
+      
+      // Store the initialized bot in session
+      session.volumeBot = volumeBot;
+      
     } else if (data === 'useExisting_no') {
       session.useExisting = false;
     } else {
