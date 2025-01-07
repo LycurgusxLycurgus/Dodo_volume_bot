@@ -1,0 +1,45 @@
+# Dependency directories
+node_modules/
+
+# Environment variables
+.env
+
+# Logs
+*.log
+error.log
+combined.log
+
+# Wallet files (sensitive information)
+wallets/*.json
+
+# Temporary files
+*.tmp
+*.bak
+
+# Dependency lock files
+package-lock.json
+yarn.lock
+
+# Build and distribution directories
+dist/
+build/
+
+# IDE and editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Solana and blockchain specific
+*.keypair
+*.seed
+
+# Miscellaneous
+.next/
+
+monoprompting_test/
+pre-templates/
