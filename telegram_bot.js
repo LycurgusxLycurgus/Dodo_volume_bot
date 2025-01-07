@@ -123,11 +123,11 @@ bot.onText(/\/begin/, async (msg) => {
   // Count existing wallets from Supabase
   let existingWalletCount = 0;
   try {
-    // Query Supabase for trader wallets
+    // Query Supabase for trader wallets using correct table name
     const { data: wallets, error } = await supabase
-      .from('wallets')
+      .from('trader_wallets')
       .select('*')
-      .like('name', 'trader_%');
+      .eq('main_wallet_pubkey', this.wallets.main.publicKey.toString());
 
     if (error) {
       throw error;
