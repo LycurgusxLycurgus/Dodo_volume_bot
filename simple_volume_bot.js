@@ -29,17 +29,16 @@ class SimpleVolumeBot extends EventEmitter {
         this.config = {
             privateKey: config.privateKey,
             rpcEndpoint: config.rpcEndpoint || process.env.SOLANA_RPC_URL,
-            slippageBps: config.slippageBps || 100, // e.g. 10% slippage if 1000 = 100%
-            priorityFee: config.priorityFee || 0.001, // default 0.001 SOL
+            slippageBps: 100, // 10% slippage
+            priorityFee: config.priorityFee || 0.001, // Updated to 0.001 SOL default
             tradeAmountUSD: config.tradeAmountUSD || 0.01,
-            minInterval: config.minInterval || 15000, // 15s
-            maxInterval: config.maxInterval || 45000, // 45s
+            minInterval: 15000, // 15 seconds minimum between trades
+            maxInterval: 45000, // 45 seconds maximum between trades
             confirmationStrategy: config.confirmationStrategy || {
                 maxRetries: 40,
+                initialBackoffMs: 250,
+                maxBackoffMs: 5000,
                 commitment: 'confirmed',
-                subscribeTimeoutMs: 45000,
-                statusCheckInterval: 2000,
-                maxBlockHeightAge: 150,
                 skipPreflight: false,
                 preflightCommitment: 'confirmed'
             }
@@ -53,48 +52,81 @@ class SimpleVolumeBot extends EventEmitter {
         };
 
         this.isRunning = false;
-        this.isStopped = false; // Additional flag if needed
+        this.isStopped = false; // We'll set this in stop(), too.
         this.pumpTester = new PumpPortalSwapTester();
         this.jupiterTester = new JupiterSwapTester();
 
-        // Connection and wallets
+        // Add new wallet management properties
         this.connection = new Connection(this.config.rpcEndpoint, 'confirmed');
         this.wallets = {
             main: null,
             traders: []
         };
-
-        // Local DB folder
         this.DB_DIR = path.join(__dirname, 'wallets');
 
-        // Confirmation manager
+        // Replace the old confirmation queue with the new manager
         this.confirmationManager = new TransactionConfirmationManager(
             this.connection,
-            this.config.confirmationStrategy
+            config.confirmationStrategy || {
+                maxRetries: 40,
+                commitment: 'confirmed',
+                subscribeTimeoutMs: 45000,
+                statusCheckInterval: 2000,
+                maxBlockHeightAge: 150,
+                rateLimits: {
+                    maxParallelRequests: 2,
+                    cooldownMs: 2000
+                }
+            }
         );
 
-        // Forward events from confirmation manager if you wish
+        // Add confirmation event forwarding
         this.confirmationManager.on('confirmationStarted', (signature) => {
             this.emit('confirmationStarted', signature);
         });
+
         this.confirmationManager.on('confirmationProgress', (status) => {
             this.emit('confirmationProgress', status);
         });
+
         this.confirmationManager.on('confirmationSuccess', () => {
             this.emit('tradeConfirmed');
         });
 
-        // Track active confirmations for cleanup
-        this.activeConfirmationManagers = new Set();
-
-        // Track intervals so we can clear them on stop
-        this.intervals = new Set();
-
-        // Initialize Supabase
+        // Initialize Supabase client
         this.supabase = createClient(
             process.env.SUPABASE_URL,
             process.env.SUPABASE_KEY
         );
+
+        // Add tracking for active confirmation managers
+        this.activeConfirmationManagers = new Set();
+
+        // Add interval tracking
+        this.intervals = new Set();
+    }
+
+    async promptForTokenType() {
+        // Note: In a real implementation, this would be handled by the frontend
+        return new Promise(resolve => {
+            logger.info('Please specify the token type:');
+            logger.info('1. PumpFun (Bonding Curve)');
+            logger.info('2. Raydium/Jupiter');
+            // Frontend would handle this input
+            resolve('pump'); // or 'jupiter'
+        });
+    }
+
+    async promptForDuration() {
+        // Note: In a real implementation, this would be handled by the frontend
+        return new Promise(resolve => {
+            logger.info('Please select duration:');
+            logger.info('1. 5 minutes');
+            logger.info('2. 1 hour');
+            logger.info('3. 4 hours');
+            // Frontend would handle this input
+            resolve(5 * 60 * 1000); // Duration in milliseconds
+        });
     }
 
     async start(tokenAddress, duration, tokenType) {
@@ -102,7 +134,7 @@ class SimpleVolumeBot extends EventEmitter {
             throw new Error('Bot is already running');
         }
 
-        // Make sure trader wallets exist
+        // Initialize trader wallets if not already done
         if (this.wallets.traders.length === 0) {
             await this.initializeTraderWallets();
         }
@@ -117,61 +149,55 @@ class SimpleVolumeBot extends EventEmitter {
         logger.info(`- Trade Amount: $${this.config.tradeAmountUSD}`);
         logger.info(`- Slippage: ${this.config.slippageBps / 100}%`);
         logger.info(`- Priority Fee: ${this.config.priorityFee} SOL`);
-        logger.info(
-          `- Trade Interval: Random ${this.config.minInterval/1000}-${this.config.maxInterval/1000} seconds`
-        );
+        logger.info(`- Trade Interval: Random ${this.config.minInterval/1000}-${this.config.maxInterval/1000} seconds`);
         logger.info(`- Duration: ${duration / 1000 / 60} minutes`);
         logger.info(`- Number of parallel traders: ${this.wallets.traders.length}`);
 
-        // Create wallet groups of size 5
+        // Create trading groups (5 wallets per group)
         const walletGroups = [];
         for (let i = 0; i < this.wallets.traders.length; i += 5) {
             walletGroups.push(this.wallets.traders.slice(i, i + 5));
         }
 
-        // Optional: track block height in an interval
-        const blockHeightInterval = setInterval(async () => {
-            try {
-                await this._updateBlockHeight();
-            } catch (err) {
-                logger.warn(`Failed to update block height: ${err.message}`);
-            }
-        }, 1000);
-        this.intervals.add(blockHeightInterval);
-
         try {
-            // Main loop
+            // Track the block height update interval
+            const blockHeightInterval = setInterval(async () => {
+                try {
+                    await this._updateBlockHeight();
+                } catch (error) {
+                    logger.warn(`Failed to update block height: ${error.message}`);
+                }
+            }, this.config.blockHeightUpdateInterval || 1000);
+            
+            this.intervals.add(blockHeightInterval);
+
             while (this.isRunning && Date.now() < this.stats.endTime) {
                 try {
-                    // For each group, do a group trade cycle in parallel
+                    // Execute trades in parallel for each group
                     await Promise.all(
                         walletGroups.map(group => this._executeGroupTradeCycle(group, tokenAddress, tokenType))
                     );
-
-                    // After parallel group cycles finish, emit status
+                    
+                    // Update and emit stats
                     this._emitStatus();
-
-                    // Random delay
+                    
+                    // Random delay between group trades
                     const delay = Math.floor(
-                        Math.random() * (this.config.maxInterval - this.config.minInterval)
+                        Math.random() * (this.config.maxInterval - this.config.minInterval) 
                         + this.config.minInterval
                     );
-                    await new Promise(res => setTimeout(res, delay));
-
-                } catch (err) {
-                    logger.error('Error executing trade cycles:', err);
-                    // In case of catastrophic error, increment total trades so it won't freeze stats
-                    this.stats.totalTrades += walletGroups.length * 5;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                } catch (error) {
+                    logger.error('Error executing trade cycles:', error);
+                    this.stats.totalTrades += walletGroups.length * 5; // Count failed attempts
                     this._emitStatus();
-                    await new Promise(res => setTimeout(res, 5000));
+                    await new Promise(resolve => setTimeout(resolve, 5000));
                 }
             }
 
-            // End
             this.isRunning = false;
             logger.info('Bot finished running');
             return this.stats;
-
         } catch (error) {
             logger.error('Error starting bot:', error);
             throw error;
@@ -180,27 +206,28 @@ class SimpleVolumeBot extends EventEmitter {
 
     async _executeGroupTradeCycle(walletGroup, tokenAddress, tokenType) {
         try {
-            // Buy
+            // Execute buys in parallel but with delay between requests
             logger.info(`Executing parallel buys for ${walletGroup.length} wallets`);
             const buyResults = await Promise.all(
-                walletGroup.map(async (wallet, idx) => {
-                    // Space out RPC calls by 1s
-                    if (idx > 0) {
-                        await new Promise(res => setTimeout(res, 1000));
+                walletGroup.map(async (wallet, index) => {
+                    // Add delay between requests
+                    if (index > 0) {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
                     }
                     return this._executeSingleTrade(tokenAddress, tokenType, wallet, 'buy');
                 })
             );
 
-            // Wait before selling
-            await new Promise(res => setTimeout(res, 5000));
+            // Wait 5 seconds before selling
+            await new Promise(resolve => setTimeout(resolve, 5000));
 
-            // Sell
+            // Execute sells in parallel but with delay between requests
             logger.info(`Executing parallel sells for ${walletGroup.length} wallets`);
             const sellResults = await Promise.all(
-                walletGroup.map(async (wallet, idx) => {
-                    if (idx > 0) {
-                        await new Promise(res => setTimeout(res, 1000));
+                walletGroup.map(async (wallet, index) => {
+                    // Add delay between requests
+                    if (index > 0) {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
                     }
                     return this._executeSingleTrade(tokenAddress, tokenType, wallet, 'sell');
                 })
@@ -212,13 +239,13 @@ class SimpleVolumeBot extends EventEmitter {
             this.stats.totalTrades += walletGroup.length * 2;
 
             return true;
-
         } catch (error) {
             logger.error('Trade cycle failed:', error);
             return false;
         }
     }
 
+    // New helper method to execute a single trade
     async _executeSingleTrade(tokenAddress, tokenType, wallet, action) {
         try {
             if (!wallet) {
@@ -228,40 +255,39 @@ class SimpleVolumeBot extends EventEmitter {
             // For Jupiter swaps
             if (tokenType === 'jupiter') {
                 const tester = new JupiterSwapTester(this.connection, wallet);
-
-                // Use our queue-based confirmation
+                
+                // Set proper confirmation strategy
                 tester.confirmTransaction = async (signature) => {
                     return await this._confirmTransaction(signature);
                 };
 
+                // --- FIX #1: use lowercase checks for action ---
                 if (action === 'buy') {
-                    // Convert USD to SOL
+                    // Get SOL price for USD conversion
                     const solPrice = await this.fetchSolPrice();
                     const solAmount = this.config.tradeAmountUSD / solPrice;
-
+                    
                     await tester.testSwap(
-                        tokenAddress, // outputMint (token to buy)
-                        solAmount,    // amount in SOL
-                        'So11111111111111111111111111111111111111112', // inputMint (SOL)
+                        tokenAddress, // Output mint (token we're buying)
+                        solAmount,    // Amount in SOL
+                        'So11111111111111111111111111111111111111112', // Input mint (SOL)
                         {
                             slippageBps: this.config.slippageBps,
                             priorityFee: this.config.priorityFee
                         }
                     );
-
                 } else if (action === 'sell') {
-                    // Check if user even has tokens
+                    // Check token balance before selling
                     const accountInfo = await this._checkTokenAccount(tokenAddress, wallet.publicKey);
                     if (!accountInfo.exists || accountInfo.balance === 0) {
                         logger.warn(`No token balance for wallet ${wallet.publicKey.toString()}`);
                         return false;
                     }
 
-                    // Sell 99% of the token to avoid rounding issues
                     await tester.testSwap(
-                        'So11111111111111111111111111111111111111112', // outputMint (SOL)
-                        accountInfo.balance * 0.99,                 // amount in token units
-                        tokenAddress,                                // inputMint (token)
+                        'So11111111111111111111111111111111111111112', // Output mint (SOL)
+                        accountInfo.balance * 0.99, // Sell 99% of balance
+                        tokenAddress, // Input mint (token)
                         {
                             slippageBps: this.config.slippageBps,
                             priorityFee: this.config.priorityFee,
@@ -269,13 +295,18 @@ class SimpleVolumeBot extends EventEmitter {
                         }
                     );
                 }
-
+            } 
             // For PumpPortal swaps
-            } else if (tokenType === 'pump') {
+            else if (tokenType === 'pump') {
+                // Reuse the PumpPortalSwapTester
                 const tester = new PumpPortalSwapTester();
-                // The PumpPortalSwapTester internally references process.env.PRIVATE_KEY
-                // but let's override if needed:
-                tester.wallet = wallet; // or setPriorityFee, etc.
+                // The constructor picks up PRIVATE_KEY from the .env, but we want to override with the trader's wallet
+                tester.wallet = {
+                    publicKey: wallet.publicKey,
+                    secretKey: wallet.secretKey,
+                    payer: wallet
+                };
+                // Also set custom priority fee
                 tester.setPriorityFee(this.config.priorityFee);
 
                 if (action === 'buy') {
@@ -284,25 +315,41 @@ class SimpleVolumeBot extends EventEmitter {
                     await tester.executeTrade(tokenAddress, 'sell', this.config.tradeAmountUSD);
                 }
             }
+            // If more swap types in future, handle here.
 
             return true;
-
         } catch (error) {
             logger.error(`Trade failed for wallet ${wallet.publicKey.toString()}: ${error.message}`);
             return false;
         }
     }
 
+    // Add helper method to fetch SOL price
     async fetchSolPrice() {
         try {
-            const response = await fetch(
-                'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd'
-            );
+            const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
             const data = await response.json();
             return data.solana.usd;
         } catch (error) {
             logger.error('Error fetching SOL price:', error);
-            return 230; // fallback if coingecko fails
+            return 230; // Fallback price
+        }
+    }
+
+    // Update _executeTradeCycle to use the new pattern
+    async _executeTradeCycle(tokenAddress, tokenType, wallet = null) {
+        this.stats.totalTrades++;
+        
+        try {
+            // Execute buy and sell sequentially for single wallet
+            await this._executeSingleTrade(tokenAddress, tokenType, wallet, 'buy');
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            await this._executeSingleTrade(tokenAddress, tokenType, wallet, 'sell');
+            
+            return true;
+        } catch (error) {
+            logger.error(`Trade cycle failed for wallet ${wallet?.publicKey.toString()}: ${error.message}`);
+            return false;
         }
     }
 
@@ -313,28 +360,26 @@ class SimpleVolumeBot extends EventEmitter {
             remainingTime: Math.floor(remainingTime / 1000),
             isRunning: this.isRunning
         };
+        
         this.emit('status', status);
-
         logger.info(
             `Status: ${status.successRate} successful trades, ` +
             `${status.remainingTime}s remaining`
         );
     }
 
+    // --- FIX #2: set isRunning = false so the while() loop can end ---
     async stop() {
         try {
             logger.info('Stopping bot...');
-
-            // This line ensures the while(...) condition breaks:
-            this.isRunning = false;
-
+            
             // Clear all intervals
             for (const interval of this.intervals) {
                 clearInterval(interval);
             }
             this.intervals.clear();
 
-            // Stop any active confirmation managers
+            // Clear any active confirmation managers
             if (this.activeConfirmationManagers) {
                 for (const manager of this.activeConfirmationManagers) {
                     manager.stop();
@@ -342,19 +387,18 @@ class SimpleVolumeBot extends EventEmitter {
                 this.activeConfirmationManagers.clear();
             }
 
+            // Add a flag to indicate the bot is stopped
             this.isStopped = true;
+            this.isRunning = false;  // <-- This ensures the main loop in start() breaks
+            
             logger.info('Bot finished running');
-
         } catch (error) {
             logger.error('Error stopping bot:', error);
             throw error;
         }
     }
 
-    // --------------
-    // WALLET METHODS
-    // --------------
-
+    // New method to create trader wallets
     async createTraderWallets(count) {
         try {
             this.wallets.traders = [];
@@ -364,7 +408,7 @@ class SimpleVolumeBot extends EventEmitter {
                 const wallet = web3.Keypair.generate();
                 this.wallets.traders.push(wallet);
 
-                // Example writing to Supabase if desired
+                // Save to Supabase with new schema
                 const { error } = await this.supabase
                     .from('trader_wallets')
                     .insert({
@@ -377,7 +421,8 @@ class SimpleVolumeBot extends EventEmitter {
                 if (error) {
                     logger.error('Failed to save trader wallet:', {
                         error: error.message,
-                        walletIndex: i
+                        walletIndex: i,
+                        traderPubkey: wallet.publicKey.toString()
                     });
                     throw error;
                 }
@@ -390,38 +435,7 @@ class SimpleVolumeBot extends EventEmitter {
         }
     }
 
-    async loadExistingWallets() {
-        try {
-            const { data: wallets, error } = await this.supabase
-                .from('trader_wallets')
-                .select('*')
-                .order('wallet_index');
-
-            if (error) {
-                logger.error('Failed to load trader wallets:', {
-                    error: error.message
-                });
-                throw error;
-            }
-            if (!wallets?.length) {
-                throw new Error('No existing wallets found in database');
-            }
-
-            this.wallets.traders = wallets.map(record => {
-                return web3.Keypair.fromSecretKey(
-                    bs58.decode(record.private_key)
-                );
-            });
-
-            logger.info('Loaded trader wallets from DB:', {
-                count: this.wallets.traders.length
-            });
-        } catch (error) {
-            logger.error('Error loading existing wallets:', error);
-            throw error;
-        }
-    }
-
+    // New method to check wallet balance
     async checkWalletBalance(wallet) {
         try {
             const balance = await this.connection.getBalance(wallet.publicKey);
@@ -432,137 +446,258 @@ class SimpleVolumeBot extends EventEmitter {
         }
     }
 
+    // New method to fund a trader wallet with retry logic
     async fundTraderWallet(traderWallet, amount) {
-        const lamports = Math.round(amount * LAMPORTS_PER_SOL);
+        const maxRetries = 3;
 
-        const transaction = new Transaction().add(
-            SystemProgram.transfer({
-                fromPubkey: this.wallets.main.publicKey,
-                toPubkey: traderWallet.publicKey,
-                lamports
-            })
-        );
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const lamports = Math.round(amount * LAMPORTS_PER_SOL);
+                
+                const transaction = new Transaction().add(
+                    SystemProgram.transfer({
+                        fromPubkey: this.wallets.main.publicKey,
+                        toPubkey: traderWallet.publicKey,
+                        lamports: lamports,
+                    })
+                );
 
-        const signature = await this.connection.sendTransaction(
-            transaction,
-            [this.wallets.main]
-        );
+                const signature = await this.connection.sendTransaction(
+                    transaction,
+                    [this.wallets.main]
+                );
 
-        logger.info(`Transaction sent: funding wallet with ${amount} SOL, sig=${signature}`);
-        const confirmed = await this._confirmTransaction(signature);
-        if (!confirmed) {
-            throw new Error('Transaction confirmation failed during funding');
+                logger.info(`Funding attempt ${attempt}: Transaction sent with signature ${signature}`);
+
+                // Use new confirmation method
+                const confirmed = await this._confirmTransaction(signature);
+                
+                if (confirmed) {
+                    logger.info(
+                        `Funded wallet ${traderWallet.publicKey.toString()} with ${amount} SOL`
+                    );
+                    return signature;
+                }
+
+            } catch (error) {
+                if (attempt === maxRetries) {
+                    logger.error(`All funding attempts failed: ${error.message}`);
+                    throw error;
+                }
+                logger.warn(`Attempt ${attempt} failed: ${error.message}, retrying...`);
+                await new Promise(resolve => setTimeout(resolve, attempt * 2000));
+            }
         }
-        logger.info(
-            `Funded wallet ${traderWallet.publicKey.toString()} with ${amount} SOL`
-        );
-        return signature;
     }
 
+    // New method to initialize all trader wallets with funds
     async initializeTraderWallets(solPerWallet = 0.01) {
         logger.info('Initializing trader wallets...');
-
+        
         if (!this.wallets.main || this.wallets.traders.length === 0) {
             throw new Error('Wallets not properly initialized');
         }
 
-        // Check each trader's balance
+        // First check all trader wallet balances
         const traderBalances = await Promise.all(
-            this.wallets.traders.map(async w => {
-                const bal = await this.checkWalletBalance(w);
-                return { wallet: w, balance: bal };
+            this.wallets.traders.map(async wallet => {
+                const balance = await this.checkWalletBalance(wallet);
+                return { wallet, balance };
             })
         );
 
-        // Calculate total needed
-        const totalNeeded = traderBalances.reduce((sum, { balance }) => {
-            return balance < solPerWallet ? sum + (solPerWallet - balance) : sum;
+        // Calculate how much total SOL needed
+        const fundingNeeded = traderBalances.reduce((total, { balance }) => {
+            const needed = balance < solPerWallet ? solPerWallet - balance : 0;
+            return total + needed;
         }, 0);
 
-        // Check main wallet
-        const mainBalance = await this.checkWalletBalance(this.wallets.main);
-        if (mainBalance < totalNeeded) {
-            throw new Error(`Main wallet has ${mainBalance} SOL, needs ${totalNeeded} SOL`);
-        }
-
-        // Fund those that need it
-        for (const { wallet, balance } of traderBalances) {
-            if (balance < solPerWallet) {
-                const needed = solPerWallet - balance;
-                await this.fundTraderWallet(wallet, needed);
-                await new Promise(res => setTimeout(res, 1000));
-            } else {
-                logger.info(
-                    `Trader wallet ${wallet.publicKey.toString()} already funded: ${balance} SOL`
+        if (fundingNeeded > 0) {
+            // Check main wallet balance
+            const mainBalance = await this.checkWalletBalance(this.wallets.main);
+            
+            if (mainBalance < fundingNeeded) {
+                throw new Error(
+                    `Insufficient balance in main wallet. Need ${fundingNeeded} SOL, has ${mainBalance} SOL`
                 );
             }
+
+            // Fund only wallets that need it
+            for (const { wallet, balance } of traderBalances) {
+                if (balance < solPerWallet) {
+                    const needed = solPerWallet - balance;
+                    await this.fundTraderWallet(wallet, needed);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                } else {
+                    logger.info(
+                        `Trader wallet ${wallet.publicKey.toString()} already has sufficient balance: ${balance} SOL`
+                    );
+                }
+            }
+        } else {
+            logger.info('All trader wallets already have sufficient balance');
         }
+
         logger.info('All trader wallets initialized successfully');
     }
 
-    // -------------
-    // CONFIRMATION
-    // -------------
+    // Add new method to load existing wallets
+    async loadExistingWallets() {
+        try {
+            const { data: wallets, error } = await this.supabase
+                .from('trader_wallets')
+                .select('*')
+                .order('wallet_index');
 
+            if (error) {
+                logger.error('Failed to load trader wallets:', {
+                    error: error.message,
+                    code: error.code,
+                    details: error.details
+                });
+                throw error;
+            }
+
+            if (!wallets?.length) {
+                throw new Error('No existing wallets found in database');
+            }
+
+            this.wallets.traders = wallets.map(record => {
+                try {
+                    return web3.Keypair.fromSecretKey(
+                        bs58.decode(record.private_key)
+                    );
+                } catch (err) {
+                    logger.error('Failed to decode wallet private key:', {
+                        walletIndex: record.wallet_index,
+                        error: err.message
+                    });
+                    throw err;
+                }
+            });
+
+            logger.info('Successfully loaded trader wallets:', {
+                count: this.wallets.traders.length,
+                indexes: wallets.map(w => w.wallet_index),
+                pubkeys: wallets.map(w => w.trader_pubkey)
+            });
+        } catch (error) {
+            logger.error('Error loading existing wallets from Supabase:', error);
+            throw error;
+        }
+    }
+
+    // Add helper method to get token balance
+    async _getTokenBalance(tokenAddress, walletAddress) {
+        try {
+            const mintPubkey = new web3.PublicKey(tokenAddress);
+            const walletPubkey = new web3.PublicKey(walletAddress);
+
+            const response = await this.connection.getTokenAccountsByOwner(walletPubkey, {
+                mint: mintPubkey
+            });
+
+            if (response.value.length === 0) {
+                return 0;
+            }
+
+            const tokenAccount = response.value[0];
+            const accountInfo = await this.connection.getTokenAccountBalance(tokenAccount.pubkey);
+            return accountInfo.value.amount;
+        } catch (error) {
+            logger.error(`Error getting token balance: ${error.message}`);
+            throw error;
+        }
+    }
+
+    // Replace _confirmTransaction with queue-based version
     async _confirmTransaction(signature) {
         try {
-            const confirmed = await this.confirmationManager.confirmTransaction(signature);
-            if (confirmed) {
-                logger.info(`Transaction confirmed: ${signature}`);
-                return true;
+            // Use exponential backoff for confirmations
+            const maxRetries = 5;
+            let attempt = 0;
+            let delay = 1000;
+
+            while (attempt < maxRetries) {
+                try {
+                    const confirmed = await this.confirmationManager.confirmTransaction(signature);
+                    if (confirmed) {
+                        logger.info(`Transaction confirmed: ${signature}`);
+                        return true;
+                    }
+                } catch (error) {
+                    if (error.message.includes('429')) {
+                        attempt++;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        delay *= 2; // Exponential backoff
+                        continue;
+                    }
+                    throw error;
+                }
             }
-            throw new Error('Transaction confirmation failed');
+            throw new Error('Transaction confirmation failed after retries');
         } catch (error) {
             logger.error(`Confirmation failed for ${signature}: ${error.message}`);
             throw error;
         }
     }
 
-    // -------------
-    // TOKEN HELPERS
-    // -------------
-
-    async _checkTokenAccount(tokenAddress, walletPubkey) {
+    // Add token account check before selling
+    async _checkTokenAccount(tokenAddress, walletAddress) {
         try {
             const mintPubkey = new web3.PublicKey(tokenAddress);
-            const ownerPubkey = new web3.PublicKey(walletPubkey);
+            const walletPubkey = new web3.PublicKey(walletAddress);
+            
+            // Get token accounts
+            const accounts = await this.connection.getTokenAccountsByOwner(
+                walletPubkey,
+                { mint: mintPubkey }
+            );
 
-            const accounts = await this.connection.getTokenAccountsByOwner(ownerPubkey, {
-                mint: mintPubkey
-            });
-
+            // Return if account exists and has balance
             if (accounts.value.length > 0) {
                 const balance = await this.connection.getTokenAccountBalance(accounts.value[0].pubkey);
                 return {
                     exists: true,
-                    balance: parseFloat(balance.value.amount),
+                    balance: balance.value.amount,
                     account: accounts.value[0].pubkey
                 };
             }
-            return { exists: false, balance: 0, account: null };
 
+            return { exists: false, balance: 0, account: null };
         } catch (error) {
             logger.error(`Error checking token account: ${error.message}`);
             return { exists: false, balance: 0, account: null };
         }
     }
 
-    // -------------
-    // BLOCK HEIGHT
-    // -------------
-
+    // Modify _updateBlockHeight to respect the stopped state
     async _updateBlockHeight() {
-        if (this.isStopped) return;
+        if (this.isStopped) {
+            return;
+        }
+
         try {
-            const slot = await this.connection.getSlot();
-            this.currentBlockHeight = slot;
+            // Use cached block height if available and recent
+            const now = Date.now();
+            if (this.lastBlockHeightUpdate && 
+                now - this.lastBlockHeightUpdate < 2000 && 
+                this.currentBlockHeight) {
+                return this.currentBlockHeight;
+            }
+
+            const blockHeight = await this.connection.getSlot();
+            this.currentBlockHeight = blockHeight;
+            this.lastBlockHeightUpdate = now;
+            return blockHeight;
         } catch (error) {
             if (error.message.includes('429')) {
-                // If rate-limited, we just skip
-                logger.warn('Rate-limited while updating block height');
-            } else {
-                throw error;
+                // Use cached value if rate limited
+                if (this.currentBlockHeight) {
+                    return this.currentBlockHeight;
+                }
             }
+            throw error;
         }
     }
 }
