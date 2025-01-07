@@ -121,34 +121,70 @@ bot.onText(/\/begin/, async (msg) => {
   const chatId = msg.chat.id;
   const session = getSession(chatId);
 
-  // Count existing wallets from Supabase
   let existingWalletCount = 0;
   try {
-    // Initialize VolumeBot first
-    const volumeBot = initializeVolumeBot();
-    const mainWalletPubkey = volumeBot.wallets.main.publicKey.toString();
+    // Get the main wallet public key from env with validation
+    if (!process.env.PRIVATE_KEY) {
+      throw new Error('PRIVATE_KEY is not defined in .env');
+    }
 
-    // Query Supabase for trader wallets
-    const { data: wallets, error } = await supabase
+    const mainWalletPubkey = Keypair.fromSecretKey(
+      bs58.decode(process.env.PRIVATE_KEY)
+    ).publicKey.toString();
+
+    logger.info('Querying trader_wallets table for:', {
+      main_wallet_pubkey: mainWalletPubkey
+    });
+
+    // Query Supabase with detailed error logging
+    const { data: wallets, error, status, statusText } = await supabase
       .from('trader_wallets')
       .select('*')
       .eq('main_wallet_pubkey', mainWalletPubkey);
 
     if (error) {
+      logger.error('Supabase query failed:', {
+        error: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint,
+        status,
+        statusText
+      });
       throw error;
     }
 
-    existingWalletCount = wallets.length;
-    
-    // Store both the wallets data and the volumeBot for later use
-    session.existingWallets = wallets;
-    session.volumeBot = volumeBot;
+    if (!wallets) {
+      logger.warn('No wallets data returned from Supabase');
+      existingWalletCount = 0;
+    } else {
+      existingWalletCount = wallets.length;
+      logger.info('Successfully retrieved wallets:', {
+        count: existingWalletCount,
+        walletIndexes: wallets.map(w => w.wallet_index)
+      });
+    }
+
+    session.existingWallets = wallets || [];
     
   } catch (error) {
-    logger.warn('Error checking existing wallets in Supabase:', error);
+    const errorMessage = error.message || 'Unknown error';
+    const errorDetails = {
+      code: error.code,
+      details: error.details,
+      hint: error.hint,
+      timestamp: new Date().toISOString()
+    };
+
+    logger.error('Error in /begin command:', {
+      error: errorMessage,
+      ...errorDetails,
+      stack: error.stack
+    });
+
     await bot.sendMessage(
       chatId, 
-      'Error initializing bot. Please check your configuration and try again.'
+      `Error checking existing wallets:\n${errorMessage}\n\nPlease check logs and try again.`
     );
     return;
   }
@@ -608,33 +644,23 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Add after other environment checks
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-  throw new Error('SUPABASE_URL and SUPABASE_KEY must be defined in your .env');
+// Add better Supabase initialization with error handling
+let supabase;
+try {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+    throw new Error('SUPABASE_URL and SUPABASE_KEY must be defined in .env');
+  }
+  supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+  logger.info('Supabase client initialized successfully');
+} catch (error) {
+  logger.error('Failed to initialize Supabase client:', {
+    error: error.message,
+    stack: error.stack
+  });
+  throw error;
 }
-
-// Initialize Supabase client
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // Start Express server
 app.listen(port, '0.0.0.0', () => {
   logger.info(`Health check server listening at http://0.0.0.0:${port}`);
 });
-
-function initializeVolumeBot() {
-  if (!process.env.PRIVATE_KEY) {
-    throw new Error('PRIVATE_KEY is not defined in your .env');
-  }
-
-  const config = {
-    privateKey: process.env.PRIVATE_KEY,
-    rpcEndpoint: process.env.SOLANA_RPC_URL
-  };
-
-  const volumeBot = new SimpleVolumeBot(config);
-  volumeBot.wallets.main = Keypair.fromSecretKey(
-    bs58.decode(process.env.PRIVATE_KEY)
-  );
-  
-  return volumeBot;
-}
