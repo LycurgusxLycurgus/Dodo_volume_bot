@@ -16,6 +16,7 @@ const path = require('path');
 const web3 = require('@solana/web3.js');
 const fetch = require('cross-fetch'); // Ensure cross-fetch is imported if needed
 const TransactionConfirmationManager = require('./transaction_confirmation_manager');
+const supabase = require('./supabase_client');
 
 class SimpleVolumeBot extends EventEmitter {
     constructor(config = {}) {
@@ -358,41 +359,41 @@ class SimpleVolumeBot extends EventEmitter {
     }
 
     // New method to create trader wallets
-    async createTraderWallets(numWallets = 10) {
-        logger.info(`Creating ${numWallets} trader wallets...`);
+    async createTraderWallets(numWallets) {
+        const mainWalletPubkey = this.wallets.main.publicKey.toString();
         
-        // Create DB directory if it doesn't exist
-        if (!fs.existsSync(this.DB_DIR)) {
-            fs.mkdirSync(this.DB_DIR, { recursive: true });
+        // First check if we already have wallets for this main wallet
+        const { data: existingWallets } = await supabase
+            .from('trader_wallets')
+            .select('*')
+            .eq('main_wallet_pubkey', mainWalletPubkey);
+
+        if (existingWallets?.length > 0) {
+            logger.info(`Found ${existingWallets.length} existing wallets in database`);
+            return this.loadExistingWallets();
         }
 
-        // Create main wallet from private key
-        this.wallets.main = Keypair.fromSecretKey(
-            bs58.decode(this.config.privateKey)
-        );
-        logger.info(`Main wallet: ${this.wallets.main.publicKey.toString()}`);
-
-        // Create trader wallets
+        logger.info(`Creating ${numWallets} new trader wallets...`);
+        
         for (let i = 0; i < numWallets; i++) {
             const wallet = Keypair.generate();
-            this.wallets.traders.push(wallet);
             
-            // Save wallet data
-            const walletData = {
-                id: `trader_${i}`,
-                publicKey: wallet.publicKey.toString(),
-                privateKey: bs58.encode(wallet.secretKey)
-            };
-            
-            fs.writeFileSync(
-                path.join(this.DB_DIR, `trader_${i}.json`),
-                JSON.stringify(walletData, null, 2)
-            );
-            
+            // Save to Supabase
+            const { error } = await supabase
+                .from('trader_wallets')
+                .insert({
+                    main_wallet_pubkey: mainWalletPubkey,
+                    wallet_index: i,
+                    secret_key: bs58.encode(wallet.secretKey)
+                });
+
+            if (error) {
+                throw new Error(`Failed to save wallet ${i}: ${error.message}`);
+            }
+
+            this.wallets.traders[i] = wallet;
             logger.info(`Created trader wallet ${i}: ${wallet.publicKey.toString()}`);
         }
-
-        return this.wallets.traders;
     }
 
     // New method to check wallet balance
@@ -503,45 +504,28 @@ class SimpleVolumeBot extends EventEmitter {
 
     // Add new method to load existing wallets
     async loadExistingWallets() {
-        logger.info('Loading existing trader wallets...');
+        const mainWalletPubkey = this.wallets.main.publicKey.toString();
         
-        // Create main wallet from private key
-        this.wallets.main = Keypair.fromSecretKey(
-            bs58.decode(this.config.privateKey)
-        );
-        logger.info(`Main wallet: ${this.wallets.main.publicKey.toString()}`);
+        const { data: wallets, error } = await supabase
+            .from('trader_wallets')
+            .select('*')
+            .eq('main_wallet_pubkey', mainWalletPubkey)
+            .order('wallet_index');
 
-        try {
-            // Check if wallets directory exists
-            if (!fs.existsSync(this.DB_DIR)) {
-                throw new Error('No existing wallets found');
-            }
-
-            // Read all wallet files
-            const files = fs.readdirSync(this.DB_DIR);
-            const traderFiles = files.filter(f => f.startsWith('trader_'));
-
-            if (traderFiles.length === 0) {
-                throw new Error('No trader wallets found');
-            }
-
-            // Load each wallet
-            for (const file of traderFiles) {
-                const walletData = JSON.parse(
-                    fs.readFileSync(path.join(this.DB_DIR, file))
-                );
-                const wallet = Keypair.fromSecretKey(
-                    bs58.decode(walletData.privateKey)
-                );
-                this.wallets.traders.push(wallet);
-                logger.info(`Loaded trader wallet: ${wallet.publicKey.toString()}`);
-            }
-
-            logger.info(`Loaded ${this.wallets.traders.length} existing trader wallets`);
-        } catch (error) {
-            logger.error('Error loading existing wallets:', error);
-            throw error;
+        if (error) {
+            throw new Error(`Failed to load wallets: ${error.message}`);
         }
+
+        if (!wallets?.length) {
+            throw new Error('No existing wallets found in database');
+        }
+
+        wallets.forEach(record => {
+            const secretKey = bs58.decode(record.secret_key);
+            this.wallets.traders[record.wallet_index] = Keypair.fromSecretKey(secretKey);
+        });
+
+        logger.info(`Loaded ${wallets.length} existing trader wallets`);
     }
 
     // Add helper method to get token balance
