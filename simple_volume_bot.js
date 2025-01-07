@@ -100,6 +100,9 @@ class SimpleVolumeBot extends EventEmitter {
 
         // Add tracking for active confirmation managers
         this.activeConfirmationManagers = new Set();
+
+        // Add interval tracking
+        this.intervals = new Set();
     }
 
     async promptForTokenType() {
@@ -155,33 +158,49 @@ class SimpleVolumeBot extends EventEmitter {
             walletGroups.push(this.wallets.traders.slice(i, i + 5));
         }
 
-        while (this.isRunning && Date.now() < this.stats.endTime) {
-            try {
-                // Execute trades in parallel for each group
-                await Promise.all(
-                    walletGroups.map(group => this._executeGroupTradeCycle(group, tokenAddress, tokenType))
-                );
-                
-                // Update and emit stats
-                this._emitStatus();
-                
-                // Random delay between group trades
-                const delay = Math.floor(
-                    Math.random() * (this.config.maxInterval - this.config.minInterval) 
-                    + this.config.minInterval
-                );
-                await new Promise(resolve => setTimeout(resolve, delay));
-            } catch (error) {
-                logger.error('Error executing trade cycles:', error);
-                this.stats.totalTrades += walletGroups.length * 5; // Count failed attempts
-                this._emitStatus();
-                await new Promise(resolve => setTimeout(resolve, 5000));
-            }
-        }
+        try {
+            // Track the block height update interval
+            const blockHeightInterval = setInterval(async () => {
+                try {
+                    await this._updateBlockHeight();
+                } catch (error) {
+                    logger.warn(`Failed to update block height: ${error.message}`);
+                }
+            }, this.config.blockHeightUpdateInterval || 1000);
+            
+            this.intervals.add(blockHeightInterval);
 
-        this.isRunning = false;
-        logger.info('Bot finished running');
-        return this.stats;
+            while (this.isRunning && Date.now() < this.stats.endTime) {
+                try {
+                    // Execute trades in parallel for each group
+                    await Promise.all(
+                        walletGroups.map(group => this._executeGroupTradeCycle(group, tokenAddress, tokenType))
+                    );
+                    
+                    // Update and emit stats
+                    this._emitStatus();
+                    
+                    // Random delay between group trades
+                    const delay = Math.floor(
+                        Math.random() * (this.config.maxInterval - this.config.minInterval) 
+                        + this.config.minInterval
+                    );
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                } catch (error) {
+                    logger.error('Error executing trade cycles:', error);
+                    this.stats.totalTrades += walletGroups.length * 5; // Count failed attempts
+                    this._emitStatus();
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+            }
+
+            this.isRunning = false;
+            logger.info('Bot finished running');
+            return this.stats;
+        } catch (error) {
+            logger.error('Error starting bot:', error);
+            throw error;
+        }
     }
 
     async _executeGroupTradeCycle(walletGroup, tokenAddress, tokenType) {
@@ -226,94 +245,74 @@ class SimpleVolumeBot extends EventEmitter {
     }
 
     // New helper method to execute a single trade
-    async _executeSingleTrade(tokenAddress, tokenType, wallet, action) {
+    async _executeSingleTrade(wallet, action) {
         try {
-            if (!wallet) {
-                throw new Error('No wallet provided for trade execution');
-            }
+            // Create the appropriate tester instance
+            const tester = action === 'BUY' 
+                ? new JupiterSwapTester(this.connection, wallet)
+                : new JupiterSwapTester(this.connection, wallet);
 
-            // Create a new instance of the swap tester with the trader wallet
-            const swapTester = tokenType === 'pump' 
-                ? new PumpPortalSwapTester()
-                : new JupiterSwapTester();
-            
-            // Initialize the wallet properly based on platform type
-            if (tokenType === 'pump') {
-                // For PumpPortal
-                swapTester.wallet = {
-                    publicKey: wallet.publicKey,
-                    secretKey: wallet.secretKey,
-                    payer: wallet,
-                    priorityFee: this.config.priorityFee
-                };
-                
-                // Set priority fee
-                swapTester.setPriorityFee(this.config.priorityFee);
-                
-                await swapTester.executeTrade(
-                    tokenAddress, 
-                    action,
-                    this.config.tradeAmountUSD
-                );
-            } else {
-                // For Jupiter
-                swapTester.wallet = {
-                    payer: wallet,
-                    publicKey: wallet.publicKey,
-                    signTransaction: async (tx) => {
-                        tx.sign([wallet]);
-                        return tx;
-                    }
-                };
-
-                // Override confirmation with our new method
-                swapTester.confirmTransaction = async (signature) => {
-                    return await this._confirmTransaction(signature);
-                };
-
-                // For Jupiter swaps, handle buy/sell differently
-                if (action === 'sell') {
-                    // Check token account first
-                    const accountInfo = await this._checkTokenAccount(
-                        tokenAddress,
-                        wallet.publicKey
-                    );
-
-                    if (!accountInfo.exists || accountInfo.balance === 0) {
-                        logger.warn(`No token balance for wallet ${wallet.publicKey.toString()}`);
-                        return false;
-                    }
-
-                    // Use 90% of actual balance
-                    const sellAmount = Math.floor(accountInfo.balance * 1);
-
-                    // Execute sell with proper parameters
-                    await swapTester.testSwap(
-                        'So11111111111111111111111111111111111111112',  // outputMint (SOL)
-                        sellAmount,                                      // amount in token units
-                        tokenAddress,                                    // inputMint (token)
-                        { swapMode: 'ExactIn' }
-                    );
-                } else {
-                    // For buys, convert USD to SOL
-                    const solPrice = await this.fetchSolPrice();
-                    const solAmount = this.config.tradeAmountUSD / solPrice; 
-                    
-                    // outputMint = token, inputMint = SOL
-                    await swapTester.testSwap(
-                        tokenAddress,  // outputMint (token we're buying)
-                        solAmount,     // amount in SOL units
-                        'So11111111111111111111111111111111111111112'  // inputMint (SOL)
-                    );
+            // Create confirmation manager for this trade
+            const confirmationManager = new TransactionConfirmationManager(this.connection, {
+                maxRetries: 3,
+                commitment: 'confirmed',
+                subscribeTimeoutMs: 45000,
+                statusCheckInterval: 2000,
+                maxBlockHeightAge: 150,
+                rateLimits: {
+                    maxParallelRequests: 2,
+                    cooldownMs: 2000
                 }
-            }
+            });
 
-            // Emit confirmation event
-            this.emit('tradeConfirmed');
-            
-            return true;
+            // Track this confirmation manager
+            this.activeConfirmationManagers.add(confirmationManager);
+
+            try {
+                // For BUY: input is SOL, output is token
+                // For SELL: input is token, output is SOL
+                const inputMint = action === 'BUY' 
+                    ? 'So11111111111111111111111111111111111111112' // SOL mint
+                    : this.config.tokenAddress;
+                
+                const outputMint = action === 'BUY'
+                    ? this.config.tokenAddress
+                    : 'So11111111111111111111111111111111111111112';
+
+                // Convert USD amount to SOL for buy, or token amount for sell
+                const solPrice = await this.fetchSolPrice();
+                const amount = action === 'BUY'
+                    ? this.config.tradeAmountUSD / solPrice // Convert USD to SOL
+                    : this.config.tradeAmountUSD; // Use token amount for sell
+
+                // Execute the swap using JupiterSwapTester's interface
+                const result = await tester.testSwap(
+                    outputMint,
+                    amount,
+                    inputMint,
+                    {
+                        slippage: this.config.slippage,
+                        priorityFee: this.config.priorityFee
+                    }
+                );
+
+                if (result && result.signature) {
+                    // Wait for confirmation using the manager
+                    const confirmed = await confirmationManager.confirmTransaction(result.signature);
+                    if (!confirmed) {
+                        throw new Error(`Transaction ${result.signature} failed to confirm`);
+                    }
+                    logger.info(`${action} successful for wallet ${wallet.publicKey.toString()}`);
+                    return true;
+                }
+
+                return false;
+            } finally {
+                // Clean up the confirmation manager
+                this.activeConfirmationManagers.delete(confirmationManager);
+            }
         } catch (error) {
-            logger.error(`${action.toUpperCase()} failed for wallet ${wallet?.publicKey.toString()}: ${error.message}`);
+            logger.error(`${action} failed for wallet ${wallet.publicKey.toString()}: ${error.message}`);
             return false;
         }
     }
@@ -363,21 +362,31 @@ class SimpleVolumeBot extends EventEmitter {
     }
 
     async stop() {
-        logger.info('Stopping bot...');
-        this.isRunning = false;
-        
-        // Wait for any pending transactions to complete
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        
-        // Clean up any active confirmation managers
-        if (this.activeConfirmationManagers) {
-            this.activeConfirmationManagers.forEach(manager => {
-                manager.removeAllListeners();
-            });
+        try {
+            logger.info('Stopping bot...');
+            
+            // Clear all intervals
+            for (const interval of this.intervals) {
+                clearInterval(interval);
+            }
+            this.intervals.clear();
+
+            // Clear any active confirmation managers
+            if (this.activeConfirmationManagers) {
+                for (const manager of this.activeConfirmationManagers) {
+                    manager.stop();
+                }
+                this.activeConfirmationManagers.clear();
+            }
+
+            // Add a flag to indicate the bot is stopped
+            this.isStopped = true;
+            
+            logger.info('Bot finished running');
+        } catch (error) {
+            logger.error('Error stopping bot:', error);
+            throw error;
         }
-        
-        logger.info('Bot finished running');
-        this.emit('stopped');
     }
 
     // New method to create trader wallets
@@ -636,48 +645,23 @@ class SimpleVolumeBot extends EventEmitter {
         }
     }
 
-    // Update the transaction confirmation handling
-    async _executeSingleTrade(wallet, action) {
+    // Modify _updateBlockHeight to respect the stopped state
+    async _updateBlockHeight() {
+        if (this.isStopped) {
+            return;
+        }
+        
         try {
-            const tester = action === 'BUY' 
-                ? new JupiterSwapTester(this.connection, wallet)
-                : new PumpPortalSwapTester(this.connection, wallet);
-
-            // Create confirmation manager for this trade
-            const confirmationManager = new TransactionConfirmationManager(this.connection, {
-                maxRetries: 3,
-                commitment: 'confirmed',
-                subscribeTimeoutMs: 45000,
-                statusCheckInterval: 2000,
-                maxBlockHeightAge: 150,
-                rateLimits: {
-                    maxParallelRequests: 2,
-                    cooldownMs: 2000
-                }
-            });
-
-            const result = await tester.testSwap({
-                tokenAddress: this.config.tokenAddress,
-                tradeAmountUSD: this.config.tradeAmountUSD,
-                slippage: this.config.slippage,
-                priorityFee: this.config.priorityFee,
-                confirmationManager
-            });
-
-            if (result.signature) {
-                // Wait for confirmation using the manager
-                const confirmed = await confirmationManager.confirmTransaction(result.signature);
-                if (!confirmed) {
-                    throw new Error(`Transaction ${result.signature} failed to confirm`);
-                }
-                logger.info(`${action} successful for wallet ${wallet.publicKey.toString()}`);
-                return true;
-            }
-
-            return false;
+            const blockHeight = await this.connection.getSlot();
+            this.currentBlockHeight = blockHeight;
         } catch (error) {
-            logger.error(`${action} failed for wallet ${wallet.publicKey.toString()}: ${error.message}`);
-            return false;
+            // Add exponential backoff for rate limiting
+            if (error.message.includes('429')) {
+                const backoffTime = Math.min(this.lastBackoff * 2 || 1000, 30000);
+                this.lastBackoff = backoffTime;
+                await new Promise(resolve => setTimeout(resolve, backoffTime));
+            }
+            throw error;
         }
     }
 }
