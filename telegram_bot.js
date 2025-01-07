@@ -59,20 +59,21 @@ const DB_DIR = path.join(__dirname, 'wallets');
 function getSession(chatId) {
   if (!userSessions[chatId]) {
     userSessions[chatId] = {
-      // We'll replicate the question flow from the CLI
       useExisting: null,
       numWallets: 5,
       solPerWallet: 0.01,
-      platform: 'pump',      // or 'jupiter'
+      platform: 'pump',
       tokenAddress: '',
       tradeAmountUSD: 0.01,
       priorityFee: 0.0001,
-      slippage: 5,           // in percent
-      duration: 6,           // in hours
+      slippage: 5,
+      duration: 6,
       confirmation: false,
-      step: 0,               // track which step of the wizard
-      volumeBot: null,       // We'll store the active volumeBot here
-      statusMessageId: null, // For dynamic edit of status
+      step: 0,
+      volumeBot: null,
+      statusMessageId: null,
+      existingWallets: null,
+      existingWalletCount: 0
     };
   }
   return userSessions[chatId];
@@ -123,11 +124,15 @@ bot.onText(/\/begin/, async (msg) => {
   // Count existing wallets from Supabase
   let existingWalletCount = 0;
   try {
-    // Query Supabase for trader wallets using correct table name
+    // Initialize VolumeBot first
+    const volumeBot = initializeVolumeBot();
+    const mainWalletPubkey = volumeBot.wallets.main.publicKey.toString();
+
+    // Query Supabase for trader wallets
     const { data: wallets, error } = await supabase
       .from('trader_wallets')
       .select('*')
-      .eq('main_wallet_pubkey', this.wallets.main.publicKey.toString());
+      .eq('main_wallet_pubkey', mainWalletPubkey);
 
     if (error) {
       throw error;
@@ -135,11 +140,17 @@ bot.onText(/\/begin/, async (msg) => {
 
     existingWalletCount = wallets.length;
     
-    // Store the wallets data for later use
+    // Store both the wallets data and the volumeBot for later use
     session.existingWallets = wallets;
+    session.volumeBot = volumeBot;
     
   } catch (error) {
     logger.warn('Error checking existing wallets in Supabase:', error);
+    await bot.sendMessage(
+      chatId, 
+      'Error initializing bot. Please check your configuration and try again.'
+    );
+    return;
   }
 
   // Store the count in the session
@@ -609,3 +620,21 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 app.listen(port, '0.0.0.0', () => {
   logger.info(`Health check server listening at http://0.0.0.0:${port}`);
 });
+
+function initializeVolumeBot() {
+  if (!process.env.PRIVATE_KEY) {
+    throw new Error('PRIVATE_KEY is not defined in your .env');
+  }
+
+  const config = {
+    privateKey: process.env.PRIVATE_KEY,
+    rpcEndpoint: process.env.SOLANA_RPC_URL
+  };
+
+  const volumeBot = new SimpleVolumeBot(config);
+  volumeBot.wallets.main = Keypair.fromSecretKey(
+    bs58.decode(process.env.PRIVATE_KEY)
+  );
+  
+  return volumeBot;
+}
