@@ -374,16 +374,22 @@ class SimpleVolumeBot extends EventEmitter {
                 const wallet = web3.Keypair.generate();
                 this.wallets.traders.push(wallet);
 
-                // Save to Supabase with correct table and column names
+                // Save to Supabase with new schema
                 const { error } = await this.supabase
                     .from('trader_wallets')
                     .insert({
-                        main_wallet_pubkey: mainWalletPubkey,
+                        trader_pubkey: wallet.publicKey.toString(),
                         wallet_index: i,
-                        secret_key: bs58.encode(wallet.secretKey)
+                        private_key: bs58.encode(wallet.secretKey),
+                        main_wallet_pubkey: mainWalletPubkey
                     });
 
                 if (error) {
+                    logger.error('Failed to save trader wallet:', {
+                        error: error.message,
+                        walletIndex: i,
+                        traderPubkey: wallet.publicKey.toString()
+                    });
                     throw error;
                 }
             }
@@ -504,15 +510,17 @@ class SimpleVolumeBot extends EventEmitter {
     // Add new method to load existing wallets
     async loadExistingWallets() {
         try {
-            const mainWalletPubkey = this.wallets.main.publicKey.toString();
-            
             const { data: wallets, error } = await this.supabase
                 .from('trader_wallets')
                 .select('*')
-                .eq('main_wallet_pubkey', mainWalletPubkey)
                 .order('wallet_index');
 
             if (error) {
+                logger.error('Failed to load trader wallets:', {
+                    error: error.message,
+                    code: error.code,
+                    details: error.details
+                });
                 throw error;
             }
 
@@ -520,12 +528,25 @@ class SimpleVolumeBot extends EventEmitter {
                 throw new Error('No existing wallets found in database');
             }
 
-            wallets.forEach(record => {
-                const secretKey = bs58.decode(record.secret_key);
-                this.wallets.traders[record.wallet_index] = web3.Keypair.fromSecretKey(secretKey);
+            this.wallets.traders = wallets.map(record => {
+                try {
+                    return web3.Keypair.fromSecretKey(
+                        bs58.decode(record.private_key)
+                    );
+                } catch (err) {
+                    logger.error('Failed to decode wallet private key:', {
+                        walletIndex: record.wallet_index,
+                        error: err.message
+                    });
+                    throw err;
+                }
             });
 
-            logger.info(`Loaded ${wallets.length} existing trader wallets from Supabase`);
+            logger.info('Successfully loaded trader wallets:', {
+                count: this.wallets.traders.length,
+                indexes: wallets.map(w => w.wallet_index),
+                pubkeys: wallets.map(w => w.trader_pubkey)
+            });
         } catch (error) {
             logger.error('Error loading existing wallets from Supabase:', error);
             throw error;

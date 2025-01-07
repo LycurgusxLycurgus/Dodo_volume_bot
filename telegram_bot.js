@@ -123,24 +123,13 @@ bot.onText(/\/begin/, async (msg) => {
 
   let existingWalletCount = 0;
   try {
-    // Get the main wallet public key from env with validation
-    if (!process.env.PRIVATE_KEY) {
-      throw new Error('PRIVATE_KEY is not defined in .env');
-    }
+    logger.info('Querying trader_wallets table for existing wallets');
 
-    const mainWalletPubkey = Keypair.fromSecretKey(
-      bs58.decode(process.env.PRIVATE_KEY)
-    ).publicKey.toString();
-
-    logger.info('Querying trader_wallets table for:', {
-      main_wallet_pubkey: mainWalletPubkey
-    });
-
-    // Query Supabase with detailed error logging
+    // Query Supabase with detailed error logging - now just get all trader wallets
     const { data: wallets, error, status, statusText } = await supabase
       .from('trader_wallets')
       .select('*')
-      .eq('main_wallet_pubkey', mainWalletPubkey);
+      .order('wallet_index');
 
     if (error) {
       logger.error('Supabase query failed:', {
@@ -161,7 +150,8 @@ bot.onText(/\/begin/, async (msg) => {
       existingWalletCount = wallets.length;
       logger.info('Successfully retrieved wallets:', {
         count: existingWalletCount,
-        walletIndexes: wallets.map(w => w.wallet_index)
+        walletIndexes: wallets.map(w => w.wallet_index),
+        traderPubkeys: wallets.map(w => w.trader_pubkey)
       });
     }
 
