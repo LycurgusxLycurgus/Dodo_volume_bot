@@ -97,6 +97,9 @@ class SimpleVolumeBot extends EventEmitter {
             process.env.SUPABASE_URL,
             process.env.SUPABASE_KEY
         );
+
+        // Add tracking for active confirmation managers
+        this.activeConfirmationManagers = new Set();
     }
 
     async promptForTokenType() {
@@ -359,9 +362,22 @@ class SimpleVolumeBot extends EventEmitter {
         );
     }
 
-    stop() {
-        this.isRunning = false;
+    async stop() {
         logger.info('Stopping bot...');
+        this.isRunning = false;
+        
+        // Wait for any pending transactions to complete
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // Clean up any active confirmation managers
+        if (this.activeConfirmationManagers) {
+            this.activeConfirmationManagers.forEach(manager => {
+                manager.removeAllListeners();
+            });
+        }
+        
+        logger.info('Bot finished running');
+        this.emit('stopped');
     }
 
     // New method to create trader wallets
@@ -617,6 +633,51 @@ class SimpleVolumeBot extends EventEmitter {
         } catch (error) {
             logger.error(`Error checking token account: ${error.message}`);
             return { exists: false, balance: 0, account: null };
+        }
+    }
+
+    // Update the transaction confirmation handling
+    async _executeSingleTrade(wallet, action) {
+        try {
+            const tester = action === 'BUY' 
+                ? new JupiterSwapTester(this.connection, wallet)
+                : new PumpPortalSwapTester(this.connection, wallet);
+
+            // Create confirmation manager for this trade
+            const confirmationManager = new TransactionConfirmationManager(this.connection, {
+                maxRetries: 3,
+                commitment: 'confirmed',
+                subscribeTimeoutMs: 45000,
+                statusCheckInterval: 2000,
+                maxBlockHeightAge: 150,
+                rateLimits: {
+                    maxParallelRequests: 2,
+                    cooldownMs: 2000
+                }
+            });
+
+            const result = await tester.testSwap({
+                tokenAddress: this.config.tokenAddress,
+                tradeAmountUSD: this.config.tradeAmountUSD,
+                slippage: this.config.slippage,
+                priorityFee: this.config.priorityFee,
+                confirmationManager
+            });
+
+            if (result.signature) {
+                // Wait for confirmation using the manager
+                const confirmed = await confirmationManager.confirmTransaction(result.signature);
+                if (!confirmed) {
+                    throw new Error(`Transaction ${result.signature} failed to confirm`);
+                }
+                logger.info(`${action} successful for wallet ${wallet.publicKey.toString()}`);
+                return true;
+            }
+
+            return false;
+        } catch (error) {
+            logger.error(`${action} failed for wallet ${wallet.publicKey.toString()}: ${error.message}`);
+            return false;
         }
     }
 }

@@ -86,8 +86,32 @@ bot.onText(/\/stop/, async (msg) => {
   const session = getSession(chatId);
 
   if (session.volumeBot && session.volumeBot.isRunning) {
-    session.volumeBot.stop();
-    await bot.sendMessage(chatId, 'Volume bot has been stopped.');
+    // Send initial stopping message
+    await bot.sendMessage(chatId, 'Stopping volume bot... Please wait.');
+    
+    try {
+      // Stop the bot
+      await session.volumeBot.stop();
+      
+      // Update status message
+      if (session.statusMessageId) {
+        await bot.editMessageText(
+          'Volume bot has been stopped.',
+          {
+            chat_id: chatId,
+            message_id: session.statusMessageId
+          }
+        );
+      } else {
+        await bot.sendMessage(chatId, 'Volume bot has been stopped.');
+      }
+    } catch (error) {
+      logger.error('Error stopping bot:', error);
+      await bot.sendMessage(
+        chatId, 
+        'Error occurred while stopping the bot. Please try again.'
+      );
+    }
   } else {
     await bot.sendMessage(chatId, 'No active volume bot to stop.');
   }
@@ -208,11 +232,37 @@ bot.on('callback_query', async (query) => {
 
   // [NEW] If user clicked "Stop Bot"
   if (data === 'stop_bot') {
-    if (session.volumeBot && session.volumeBot.isRunning) {
-      session.volumeBot.stop();
-      await bot.sendMessage(chatId, 'Volume bot has been stopped via inline button.');
-    } else {
-      await bot.sendMessage(chatId, 'No active volume bot to stop.');
+    // Send initial stopping message
+    await bot.editMessageText(
+      'Stopping volume bot... Please wait.',
+      {
+        chat_id: chatId,
+        message_id: query.message.message_id
+      }
+    );
+
+    try {
+      if (session.volumeBot) {
+        await session.volumeBot.stop();
+        
+        // Update status message
+        await bot.editMessageText(
+          'Volume bot has been stopped.',
+          {
+            chat_id: chatId,
+            message_id: query.message.message_id
+          }
+        );
+      }
+    } catch (error) {
+      logger.error('Error stopping bot:', error);
+      await bot.editMessageText(
+        'Error occurred while stopping the bot. Please try again.',
+        {
+          chat_id: chatId,
+          message_id: query.message.message_id
+        }
+      );
     }
     await bot.answerCallbackQuery(query.id);
     return; // Stop processing further
